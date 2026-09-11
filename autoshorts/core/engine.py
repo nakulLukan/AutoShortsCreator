@@ -69,23 +69,71 @@ class VideoProcessorEngine:
             working_file, heatmap_data = self._ingest()
             self._progress.report_progress(25, f"Media ready: {working_file}")
 
-            # ── Step 2: Highlight Detection ─────────────────────────
+            # ── Step 2a: Scene Detection ────────────────────────────
+            self._check_cancelled()
+            self._progress.report_progress(30, "Detecting scene boundaries...")
+            try:
+                from scenedetect import detect, ContentDetector
+                import logging
+                logging.getLogger("scenedetect").setLevel(logging.WARNING)
+                
+                scene_list = detect(working_file, ContentDetector())
+                scene_bounds = [(s.get_seconds(), e.get_seconds()) for s, e in scene_list]
+                self._log.log(f"Detected {len(scene_bounds)} scenes.", LogLevel.INFO)
+            except Exception as e:
+                self._log.log(f"Scene detection failed: {e}", LogLevel.WARN)
+                scene_bounds = None
+
+            # ── Step 2b: Highlight Detection ─────────────────────────
             self._check_cancelled()
             strategy = self._select_strategy(heatmap_data)
-            start_time = strategy.find_highlight(
-                working_file, self._options.target_duration,
+            
+            max_clips = self._options.max_clips
+            clip_duration = self._options.target_duration / max_clips
+            
+            highlights = strategy.find_highlights(
+                working_file, clip_duration, max_clips, scene_bounds
             )
+            
+            if self._options.arrangement == "Linear":
+                # Sort chronologically by start time
+                highlights.sort(key=lambda x: x[0])
+            else:
+                # Sort by score descending
+                highlights.sort(key=lambda x: x[1], reverse=True)
+
             self._progress.report_progress(
-                75, f"Highlight identified at {start_time:.2f} seconds.",
+                75, f"Identified {len(highlights)} highlight(s).",
             )
 
             # ── Step 3: Rendering ───────────────────────────────────
             self._check_cancelled()
             renderer = VideoRenderer(self._config, self._log, self._progress)
-            renderer.render(
-                working_file, start_time,
-                self._output_path, self._options,
-            )
+            
+            temp_clips = []
+            for i, (start_time, score) in enumerate(highlights):
+                self._check_cancelled()
+                temp_clip_path = str(self._config.temp_dir / f"temp_clip_{i}.mp4")
+                
+                # Scale progress between 75 and 95
+                pct = 75 + int(20 * (i / len(highlights)))
+                self._progress.report_progress(
+                    pct, f"Rendering clip {i+1}/{len(highlights)} (start: {start_time:.1f}s)..."
+                )
+                
+                renderer.render(
+                    working_file, start_time,
+                    temp_clip_path, self._options, clip_duration
+                )
+                temp_clips.append(temp_clip_path)
+
+            # ── Step 4: Concatenation ───────────────────────────────
+            self._check_cancelled()
+            self._progress.report_progress(95, "Concatenating clips into final video...")
+            self._concatenate_clips(temp_clips, self._output_path)
+            
+            for temp_clip in temp_clips:
+                Path(temp_clip).unlink(missing_ok=True)
 
             self._progress.report_progress(100, "Processing Complete!")
             self._log.log(
@@ -108,7 +156,7 @@ class VideoProcessorEngine:
         """Download from URL or validate local file. Returns (path, heatmap_or_None)."""
         if self._options.is_url:
             downloader = VideoDownloader(self._config, self._log, self._progress)
-            return downloader.download(self._options.input_source)
+            return downloader.download(self._options.input_source, self._options.browser_cookies)
         else:
             return self._options.input_source, None
 
@@ -126,6 +174,42 @@ class VideoProcessorEngine:
                 LogLevel.INFO,
             )
             return MultimodalAnalyzer(self._config, self._log, self._progress)
+
+    def _concatenate_clips(self, clip_paths: list[str], output_path: str) -> None:
+        """Concatenate multiple video clips into a single output file using FFmpeg."""
+        if not clip_paths:
+            return
+            
+        if len(clip_paths) == 1:
+            shutil.copy(clip_paths[0], output_path)
+            return
+            
+        list_file = self._config.temp_dir / "concat_list.txt"
+        with open(list_file, 'w', encoding='utf-8') as f:
+            for path in clip_paths:
+                safe_path = Path(path).as_posix()
+                f.write(f"file '{safe_path}'\n")
+                
+        cmd = [
+            str(self._config.ffmpeg_path), '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', str(list_file),
+            '-c', 'copy',
+            output_path
+        ]
+        
+        self._log.log(f"Concatenating clips: {' '.join(cmd)}", LogLevel.DEBUG)
+        
+        import subprocess
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+        )
+        if result.returncode != 0:
+            self._log.log(f"FFmpeg concat failed: {result.stderr}", LogLevel.ERROR)
+            raise RuntimeError(f"FFmpeg concat failed: {result.stderr}")
+            
+        list_file.unlink(missing_ok=True)
 
     def _cleanup_temp_files(self) -> None:
         """Remove temporary files created during processing."""

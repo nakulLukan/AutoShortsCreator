@@ -24,7 +24,7 @@ class VideoDownloader:
         self._log = logger
         self._progress = progress_reporter
 
-    def download(self, url: str) -> Tuple[str, Optional[List[Dict]]]:
+    def download(self, url: str, browser_cookies: str = "None") -> Tuple[str, Optional[List[Dict]]]:
         """
         Download a video from the given URL.
 
@@ -43,6 +43,9 @@ class VideoDownloader:
             'no_warnings': True,
             'dump_single_json': True,
         }
+        
+        if browser_cookies and browser_cookies.lower() != "none":
+            ydl_opts['cookiesfrombrowser'] = (browser_cookies.lower(),)
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             # First extract info to check for heatmap

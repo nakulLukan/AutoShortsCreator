@@ -42,9 +42,10 @@ class HighlightStrategy(Protocol):
     and return its start time in seconds.
     """
 
-    def find_highlight(self, video_path: str, target_duration: int) -> float:
+    def find_highlights(self, video_path: str, target_duration: int, max_clips: int, scene_list: list = None) -> list[tuple[float, float]]:
         """
-        Analyze the video and return the start time (in seconds) of the
-        best highlight segment of the given target duration.
+        Analyze the video and return the start times and scores of the
+        best highlight segments of the given target duration.
+        Optional scene_list provides [(start, end)] bounds in seconds.
         """
         ...

@@ -1,4 +1,5 @@
 import subprocess
+import concurrent.futures
 from typing import List
 
 import numpy as np
@@ -12,17 +13,14 @@ from autoshorts.models import LogLevel
 
 class MultimodalAnalyzer:
     """
-    Highlight detection strategy using audio energy and visual motion analysis.
+    Highlight detection strategy using audio energy, speech detection, and visual motion analysis.
 
     Combines:
-    - Audio: RMS energy + spectral flux (onset strength)
-    - Visual: Farneback dense optical flow magnitude
+    - Audio: RMS energy + spectral flux + Silero VAD (Voice Activity Detection)
+    - Visual: Fast frame difference (absdiff) magnitude
 
-    Scores are fused with configurable weights and smoothed with a Gaussian
-    filter. A sliding window (O(n) via np.convolve) finds the segment with
-    the highest aggregate engagement score.
-
-    Implements the HighlightStrategy protocol.
+    Scores are computed in parallel, fused with configurable weights, and smoothed with a Gaussian
+    filter. A sliding window (O(n) via np.convolve) finds the segment with the highest score.
     """
 
     def __init__(
@@ -35,32 +33,33 @@ class MultimodalAnalyzer:
         self._log = logger
         self._progress = progress_reporter
 
-    def find_highlight(self, video_path: str, target_duration: int) -> float:
+    def find_highlights(self, video_path: str, target_duration: int, max_clips: int, scene_list: list = None) -> list[tuple[float, float]]:
         """
-        Analyze audio energy and visual motion to find the most engaging
-        segment of `target_duration` seconds. Returns the start time in seconds.
+        Analyze audio and visual features to find the most engaging segments.
         """
-        # Progress allocation:
-        #   30-40%  Audio extraction (FFmpeg)
-        #   40-48%  Audio feature computation (librosa)
-        #   48-68%  Visual motion analysis (optical flow) — the heavy part
-        #   68-72%  Score fusion
-        #   72-75%  Sliding window search
+        self._progress.report_progress(30, "Starting parallel multimodal analysis...")
 
-        audio_score, times = self._analyze_audio(video_path)
-        visual_scores, visual_times, video_duration = self._analyze_visual(video_path)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future_audio = executor.submit(self._analyze_audio, video_path)
+            future_visual = executor.submit(self._analyze_visual, video_path)
+            
+            # Wait for both to complete
+            audio_score, times = future_audio.result()
+            visual_scores, visual_times, video_duration = future_visual.result()
 
         return self._fuse_and_search(
             audio_score, times,
             visual_scores, visual_times,
             video_duration, target_duration,
+            max_clips,
+            scene_list
         )
 
     # ── Audio Analysis ──────────────────────────────────────────────
 
     def _analyze_audio(self, video_path: str):
-        """Extract audio track and compute RMS + spectral flux scores."""
-        self._progress.report_progress(30, "Extracting audio track from video...")
+        """Extract audio track, compute RMS + spectral flux, and apply Silero VAD."""
+        self._progress.report_progress(35, "[Audio] Extracting track...")
 
         sr = self._config.analysis.audio_sample_rate
         audio_path = str(self._config.temp_dir / "temp_audio.wav")
@@ -77,31 +76,56 @@ class MultimodalAnalyzer:
             self._log.log(f"FFmpeg audio extraction failed: {result.stderr}", LogLevel.ERROR)
             raise RuntimeError(f"FFmpeg audio extraction failed: {result.stderr}")
 
-        self._progress.report_progress(40, "Loading audio waveform...")
+        self._progress.report_progress(40, "[Audio] Loading waveform...")
         y, sr = librosa.load(audio_path, sr=sr)
         audio_duration_sec = len(y) / sr
-        self._log.log(f"Audio loaded: {audio_duration_sec:.1f}s at {sr}Hz", LogLevel.INFO)
 
-        self._progress.report_progress(42, "Computing RMS energy...")
+        self._progress.report_progress(45, "[Audio] Computing features (RMS & Onset)...")
         rms = librosa.feature.rms(y=y)[0]
         times = librosa.frames_to_time(np.arange(len(rms)), sr=sr)
-
-        self._progress.report_progress(44, "Computing spectral flux (onset strength)...")
         onset_env = librosa.onset.onset_strength(y=y, sr=sr)
 
-        self._progress.report_progress(46, "Normalizing audio features...")
         rms_norm = rms / np.max(rms) if np.max(rms) > 0 else rms
         onset_norm = onset_env / np.max(onset_env) if np.max(onset_env) > 0 else onset_env
-        audio_score = (rms_norm * 0.5) + (onset_norm * 0.5)
 
-        self._log.log(f"Audio analysis complete: {len(rms)} frames scored.", LogLevel.INFO)
+        # Run Silero VAD
+        self._progress.report_progress(50, "[Audio] Running Silero VAD...")
+        try:
+            from silero_vad import load_silero_vad, get_speech_timestamps, read_audio
+            import logging
+            logging.getLogger("silero_vad").setLevel(logging.WARNING)
+
+            vad_model = load_silero_vad(onnx=True)
+            wav = read_audio(audio_path)
+            speech_timestamps = get_speech_timestamps(wav, vad_model, return_seconds=True)
+            
+            vad_mask = np.zeros_like(rms_norm)
+            hop_length = 512  # librosa default
+            
+            for seg in speech_timestamps:
+                start_idx = int(seg['start'] * sr / hop_length)
+                end_idx = int(seg['end'] * sr / hop_length)
+                # Keep index within bounds
+                start_idx = min(start_idx, len(vad_mask) - 1)
+                end_idx = min(end_idx, len(vad_mask))
+                vad_mask[start_idx:end_idx] = 1.0
+
+            audio_score = (rms_norm * 0.3) + (onset_norm * 0.3) + (vad_mask * 0.4)
+            self._log.log(
+                f"Audio analysis complete with VAD. Found {len(speech_timestamps)} speech segments.", 
+                LogLevel.INFO
+            )
+        except Exception as e:
+            self._log.log(f"Silero VAD failed, falling back to basic audio scoring: {e}", LogLevel.WARN)
+            audio_score = (rms_norm * 0.5) + (onset_norm * 0.5)
+
         return audio_score, times
 
     # ── Visual Analysis ─────────────────────────────────────────────
 
     def _analyze_visual(self, video_path: str):
-        """Compute dense optical flow motion scores by sampling video frames."""
-        self._progress.report_progress(48, "Opening video for visual analysis...")
+        """Compute visual motion scores by sampling video frames using fast absdiff."""
+        self._progress.report_progress(35, "[Visual] Opening video for motion analysis...")
 
         resolution = self._config.analysis.optical_flow_resolution
         divisor = self._config.analysis.frame_sample_rate_divisor
@@ -142,12 +166,9 @@ class MultimodalAnalyzer:
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     gray = cv2.resize(gray, resolution)
 
-                    # Farneback Dense Optical Flow
-                    flow = cv2.calcOpticalFlowFarneback(
-                        prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0,
-                    )
-                    mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-                    mean_mag = float(np.mean(mag))
+                    # Fast Frame Difference instead of dense optical flow
+                    diff = cv2.absdiff(prev_gray, gray)
+                    mean_mag = float(cv2.mean(diff)[0])
 
                     visual_scores.append(mean_mag)
                     visual_times.append(frame_count / fps)
@@ -156,16 +177,15 @@ class MultimodalAnalyzer:
                     frame_count += frame_step
                     samples_processed += 1
 
-                    # Report progress: map optical flow work to 48%–68% range
+                    # Report progress
                     fraction = min(samples_processed / total_samples, 1.0)
-                    current_pct = int(48 + fraction * 20)
+                    current_pct = int(35 + fraction * 30)  # Map to 35-65%
                     if current_pct != last_reported_pct:
                         last_reported_pct = current_pct
                         time_pos = frame_count / fps
                         self._progress.report_progress(
                             current_pct,
-                            f"Analyzing motion: {samples_processed}/{total_samples} samples "
-                            f"({time_pos:.0f}s / {video_duration:.0f}s)",
+                            f"[Visual] Motion: {samples_processed}/{total_samples} samples",
                         )
 
                     if frame_count > total_frames:
@@ -186,9 +206,10 @@ class MultimodalAnalyzer:
         audio_score, times,
         visual_scores, visual_times,
         video_duration: float, target_duration: int,
-    ) -> float:
-        """Fuse audio and visual scores, then find the best highlight window."""
-        # Normalize visual scores
+        max_clips: int,
+        scene_list: list = None
+    ) -> list[tuple[float, float]]:
+        """Fuse audio and visual scores, then find the best highlight windows."""
         v_scores_arr = np.array(visual_scores)
         v_scores_norm = (
             v_scores_arr / np.max(v_scores_arr)
@@ -198,7 +219,6 @@ class MultimodalAnalyzer:
 
         self._progress.report_progress(69, "Interpolating visual scores to audio timeline...")
 
-        # Interpolate visual scores to match audio timeline resolution
         v_scores_interp = np.interp(times, visual_times, v_scores_norm)
 
         w_audio = self._config.analysis.default_fusion_weights.get('audio', 0.5)
@@ -209,40 +229,61 @@ class MultimodalAnalyzer:
         )
         total_score = (audio_score * w_audio) + (v_scores_interp * w_visual)
 
-        # Apply 1D Gaussian filter to smooth the scores
         kernel = self._config.analysis.gaussian_blur_kernel
         smoothed_score = cv2.GaussianBlur(
             total_score.reshape(-1, 1), kernel, 0,
         ).flatten()
 
-        self._progress.report_progress(72, "Searching for best highlight window...")
+        self._progress.report_progress(72, "Searching for best highlight windows...")
 
-        # Find the window of `target_duration` with the highest integral
         samples_per_sec = len(smoothed_score) / video_duration
         window_size = int(target_duration * samples_per_sec)
 
-        # Ensure window isn't larger than the video
         if window_size >= len(smoothed_score):
             self._log.log(
                 "Video is shorter than target duration. Using start of video.",
                 LogLevel.WARN,
             )
-            return 0.0
+            return [(0.0, 0.0)]
 
-        # O(n) sliding window via convolution (replaces original O(n²) loop)
         window_sums = np.convolve(smoothed_score, np.ones(window_size), mode='valid')
-        best_start_idx = int(np.argmax(window_sums))
-        max_sum = float(window_sums[best_start_idx])
 
         self._log.log(
-            f"Sliding window: size={window_size} samples, "
-            f"searched {len(window_sums)} positions.",
+            f"Sliding window: size={window_size} samples, searched {len(window_sums)} positions.",
             LogLevel.INFO,
         )
 
-        best_start_time = float(times[best_start_idx])
-        self._log.log(
-            f"Best highlight found at {best_start_time:.2f}s (score: {max_sum:.2f}).",
-            LogLevel.INFO,
-        )
-        return best_start_time
+        # Non-maximum suppression to find top `max_clips` non-overlapping windows
+        sorted_indices = np.argsort(window_sums)[::-1]
+        
+        selected_clips = []
+        for idx in sorted_indices:
+            if len(selected_clips) >= max_clips:
+                break
+                
+            overlap = False
+            for selected_idx, _, _ in selected_clips:
+                if abs(idx - selected_idx) < window_size:
+                    overlap = True
+                    break
+                    
+            if not overlap:
+                best_start_time = float(times[idx])
+                score = float(window_sums[idx])
+                
+                if scene_list:
+                    nearest = min(scene_list, key=lambda s: abs(s[0] - best_start_time))
+                    if abs(nearest[0] - best_start_time) < 5.0:
+                        self._log.log(f"Snapping highlight from {best_start_time:.2f}s to scene boundary at {nearest[0]:.2f}s", LogLevel.INFO)
+                        best_start_time = nearest[0]
+
+                selected_clips.append((idx, best_start_time, score))
+                self._log.log(
+                    f"Best highlight found at {best_start_time:.2f}s (score: {score:.2f}).",
+                    LogLevel.INFO,
+                )
+
+        if not selected_clips:
+            return [(0.0, 0.0)]
+
+        return [(clip[1], clip[2]) for clip in selected_clips]

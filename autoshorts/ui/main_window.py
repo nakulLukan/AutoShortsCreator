@@ -79,6 +79,23 @@ class MainWindow(QMainWindow):
         dur_layout.addWidget(self._duration_spinbox)
         config_layout.addLayout(dur_layout)
 
+        # Max Clips
+        clips_layout = QVBoxLayout()
+        clips_layout.addWidget(QLabel("Max Clips:"))
+        self._clips_spinbox = QSpinBox()
+        self._clips_spinbox.setRange(1, 10)
+        self._clips_spinbox.setValue(1)
+        clips_layout.addWidget(self._clips_spinbox)
+        config_layout.addLayout(clips_layout)
+
+        # Arrangement
+        arr_layout = QVBoxLayout()
+        arr_layout.addWidget(QLabel("Arrangement:"))
+        self._arr_combo = QComboBox()
+        self._arr_combo.addItems(["Linear", "Non-linear"])
+        arr_layout.addWidget(self._arr_combo)
+        config_layout.addLayout(arr_layout)
+
         # Hardware Acceleration
         hw_layout = QVBoxLayout()
         hw_layout.addWidget(QLabel("Hardware Acceleration:"))
@@ -88,6 +105,35 @@ class MainWindow(QMainWindow):
         ])
         hw_layout.addWidget(self._hw_combo)
         config_layout.addLayout(hw_layout)
+        
+        # Browser Cookies
+        cookies_layout = QVBoxLayout()
+        cookies_layout.addWidget(QLabel("YouTube Cookies:"))
+        self._cookies_combo = QComboBox()
+        self._cookies_combo.addItems([
+            "None", "Chrome", "Edge", "Firefox", "Brave", "Opera", "Safari", "Vivaldi"
+        ])
+        self._cookies_combo.setToolTip("Select browser to extract cookies from if video is age-restricted.")
+        cookies_layout.addWidget(self._cookies_combo)
+        config_layout.addLayout(cookies_layout)
+
+        # Crop Mode
+        crop_layout = QVBoxLayout()
+        crop_layout.addWidget(QLabel("Crop Mode:"))
+        self._crop_combo = QComboBox()
+        self._crop_combo.addItems(["Dynamic", "Static"])
+        crop_layout.addWidget(self._crop_combo)
+        config_layout.addLayout(crop_layout)
+
+        # Skip Frames
+        skip_layout = QVBoxLayout()
+        skip_layout.addWidget(QLabel("Skip Frames:"))
+        self._skip_spinbox = QSpinBox()
+        self._skip_spinbox.setRange(0, 60)
+        self._skip_spinbox.setValue(0)
+        self._skip_spinbox.setToolTip("0 = process all frames. >0 = skip N frames for faster AI tracking.")
+        skip_layout.addWidget(self._skip_spinbox)
+        config_layout.addLayout(skip_layout)
 
         main_layout.addWidget(config_group)
 
@@ -202,6 +248,11 @@ class MainWindow(QMainWindow):
             target_duration=self._duration_spinbox.value(),
             hardware_accel=hw_flag,
             fusion_weights=self._config.analysis.default_fusion_weights,
+            max_clips=self._clips_spinbox.value(),
+            arrangement=self._arr_combo.currentText(),
+            crop_mode=self._crop_combo.currentText(),
+            skip_frames=self._skip_spinbox.value(),
+            browser_cookies=self._cookies_combo.currentText(),
         )
 
         # Update UI state

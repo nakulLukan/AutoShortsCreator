@@ -12,7 +12,7 @@ class AnalysisConfig:
     """Tunable parameters for audio/visual highlight analysis."""
     audio_sample_rate: int = 16000
     optical_flow_resolution: Tuple[int, int] = (320, 180)
-    frame_sample_rate_divisor: float = 2.0  # fps / this = samples per second
+    frame_sample_rate_divisor: float = 15.0  # fps / this = samples per second
     gaussian_blur_kernel: Tuple[int, int] = (51, 1)
     default_fusion_weights: Dict[str, float] = field(
         default_factory=lambda: {'audio': 0.6, 'visual': 0.4}

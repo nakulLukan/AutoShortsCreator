@@ -12,6 +12,11 @@ class ProcessingOptions:
     target_duration: int
     hardware_accel: str
     fusion_weights: Dict[str, float]
+    max_clips: int = 1
+    arrangement: str = "Linear"
+    crop_mode: str = "Dynamic"
+    skip_frames: int = 0
+    browser_cookies: str = "None"
 
 
 class LogLevel(str, Enum):
